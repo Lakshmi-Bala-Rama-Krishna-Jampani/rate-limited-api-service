@@ -1,36 +1,112 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+## Rate-Limited API Service
 
-## Getting Started
+Backend service that provides:
 
-First, run the development server:
+- `POST /request` — accepts `{ user_id, payload }` and enforces a per-user rate limit
+- `GET /stats` — returns per-user request statistics
+
+Rate limiting:
+
+- **Max 5 requests per user per minute**
+- Returns **HTTP 429** with `Retry-After` when exceeded
+- Data stored **in-memory** (no DB)
+
+## Running locally
+
+Install deps:
+
+```bash
+npm install
+```
+
+Start dev server:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The service runs at `http://localhost:3000`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Test / quality checks
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm test
+npm run lint
+npm run build
+```
 
-## Learn More
+## API
 
-To learn more about Next.js, take a look at the following resources:
+### POST `/request`
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Request body:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```json
+{
+  "user_id": "u1",
+  "payload": { "any": "json" }
+}
+```
 
-## Deploy on Vercel
+Example:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+curl -i -X POST http://localhost:3000/request \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"u1","payload":{"hello":"world"}}'
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Successful response (200) includes `rate_limit` info (remaining quota, etc).
+
+When limited (429), response includes:
+
+- `error.code = "RATE_LIMITED"`
+- `rate_limit.retryAfterMs`
+- `Retry-After` header (seconds)
+- `X-RateLimit-*` headers (limit/remaining/reset)
+
+Optional retry behavior (bounded):
+
+- Add `?wait=true&max_wait_ms=2000` to allow the server to wait up to 2s and retry once when limited.
+
+### GET `/stats`
+
+Example:
+
+```bash
+curl -s http://localhost:3000/stats
+```
+
+Returns per-user counters (`total`, `allowed`, `rejected`) and the current `inWindowCount`.
+
+## Design decisions
+
+- **Sliding window limiter**: each user stores a list of request timestamps; on each call we prune timestamps older than 60s and decide allow/reject.
+- **Concurrency correctness under parallel calls**: the limiter decision is **fully synchronous** (no awaits), so the check+update is atomic within a Node.js event loop tick.
+- **Performance-conscious**: pruning uses a logical head index (no `Array.shift()`), with periodic compaction.
+- **Production-considerate memory behavior**: includes best-effort garbage collection of inactive users to avoid unbounded growth.
+
+Key files:
+
+- `src/lib/rateLimiter.ts` — limiter + stats (in-memory)
+- `src/app/request/route.ts` — `POST /request`
+- `src/app/stats/route.ts` — `GET /stats`
+
+## Configuration
+
+Optional env vars:
+
+- `RATE_LIMIT_MAX_PER_WINDOW` (default `5`)
+- `RATE_LIMIT_WINDOW_MS` (default `60000`)
+
+## Testing
+
+```bash
+npm test
+```
+
+## Limitations (and what I’d improve with more time)
+
+- **In-memory state isn’t shared across instances**: if deployed with multiple replicas (or serverless cold starts), each instance has its own limiter state. With more time, I’d back this with **Redis** (atomic INCR + TTL, or a Lua script for sliding window/token bucket).
+- **Next.js dev hot reload resets memory**: restarting the server resets stats/limits. In production (`next build && next start`) this is stable within a process.
+- **More robustness**: structured logging, metrics (`/metrics` for Prometheus), request IDs, and load tests.
